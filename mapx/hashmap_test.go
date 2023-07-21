@@ -1,4 +1,4 @@
-// Copyright 2021 gotomicro
+// Copyright 2021 ecodeclub
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -21,6 +21,9 @@ import (
 
 	"github.com/stretchr/testify/assert"
 )
+
+// 借助 testData 来验证一下 HashMap 实现了 mapi 接口
+var _ mapi[testData, int] = &HashMap[testData, int]{}
 
 func TestHashMap(t *testing.T) {
 	testKV := []struct {
@@ -541,5 +544,4 @@ func BenchmarkMyHashMap(b *testing.B) {
 			_ = m[uint64(i)]
 		}
 	})
-
 }

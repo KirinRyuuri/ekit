@@ -1,4 +1,4 @@
-// Copyright 2021 gotomicro
+// Copyright 2021 ecodeclub
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -15,8 +15,8 @@
 package set
 
 import (
-	"github.com/gotomicro/ekit"
-	"github.com/gotomicro/ekit/mapx"
+	"github.com/ecodeclub/ekit"
+	"github.com/ecodeclub/ekit/mapx"
 )
 
 type TreeSet[T any] struct {
@@ -48,8 +48,7 @@ func (s *TreeSet[T]) Exist(key T) bool {
 
 // Keys 方法返回的元素顺序不固定
 func (s *TreeSet[T]) Keys() []T {
-	keys, _ := s.treeMap.KeyValues()
-	return keys
+	return s.treeMap.Keys()
 }
 
 var _ Set[int] = (*TreeSet[int])(nil)

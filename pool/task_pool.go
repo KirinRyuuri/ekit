@@ -1,4 +1,4 @@
-// Copyright 2021 gotomicro
+// Copyright 2021 ecodeclub
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -23,7 +23,7 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/gotomicro/ekit/bean/option"
+	"github.com/ecodeclub/ekit/bean/option"
 )
 
 var (
@@ -47,37 +47,6 @@ var (
 
 	defaultMaxIdleTime = 10 * time.Second
 )
-
-// TaskPool 任务池
-type TaskPool interface {
-	// Submit 执行一个任务
-	// 如果任务池提供了阻塞的功能，那么如果在 ctx 过期都没有提交成功，那么应该返回错误
-	// 调用 Start 之后能否继续提交任务，则取决于具体的实现
-	// 调用 Shutdown 或者 ShutdownNow 之后提交任务都会返回错误
-	Submit(ctx context.Context, task Task) error
-
-	// Start 开始调度任务执行。在调用 Start 之前，所有的任务都不会被调度执行。
-	// Start 之后，能否继续调用 Submit 提交任务，取决于具体的实现
-	Start() error
-
-	// Shutdown 关闭任务池。如果此时尚未调用 Start 方法，那么将会立刻返回。
-	// 任务池将会停止接收新的任务，但是会继续执行剩下的任务，
-	// 在所有任务执行完毕之后，用户可以从返回的 chan 中得到通知
-	// 任务池在发出通知之后会关闭 chan struct{}
-	Shutdown() (<-chan struct{}, error)
-
-	// ShutdownNow 立刻关闭线程池
-	// 任务池能否中断当前正在执行的任务，取决于 TaskPool 的具体实现，以及 Task 的具体实现
-	// 该方法会返回所有剩下的任务，剩下的任务是否包含正在执行的任务，也取决于具体的实现
-	ShutdownNow() ([]Task, error)
-}
-
-// Task 代表一个任务
-type Task interface {
-	// Run 执行任务
-	// 如果 ctx 设置了超时时间，那么实现者需要自己决定是否进行超时控制
-	Run(ctx context.Context) error
-}
 
 // TaskFunc 一个可执行的任务
 type TaskFunc func(ctx context.Context) error
@@ -163,16 +132,13 @@ type OnDemandBlockTaskPool struct {
 	maxIdleTime time.Duration
 	// 队列积压率
 	queueBacklogRate float64
-	shutdownOnce     sync.Once
 
 	// 协程id方便调试程序
 	id int32
 
-	// 外部信号
-	shutdownDone chan struct{}
-	// 内部中断信号
-	shutdownNowCtx    context.Context
-	shutdownNowCancel context.CancelFunc
+	// 中断信号
+	interruptCtx       context.Context
+	interruptCtxCancel context.CancelFunc
 }
 
 // NewOnDemandBlockTaskPool 创建一个新的 OnDemandBlockTaskPool
@@ -187,15 +153,14 @@ func NewOnDemandBlockTaskPool(initGo int, queueSize int, opts ...option.Option[O
 		return nil, fmt.Errorf("%w：queueSize应该大于等于0", errInvalidArgument)
 	}
 	b := &OnDemandBlockTaskPool{
-		queue:        make(chan Task, queueSize),
-		shutdownDone: make(chan struct{}, 1),
-		initGo:       int32(initGo),
-		coreGo:       int32(initGo),
-		maxGo:        int32(initGo),
-		maxIdleTime:  defaultMaxIdleTime,
+		queue:       make(chan Task, queueSize),
+		initGo:      int32(initGo),
+		coreGo:      int32(initGo),
+		maxGo:       int32(initGo),
+		maxIdleTime: defaultMaxIdleTime,
 	}
-
-	b.shutdownNowCtx, b.shutdownNowCancel = context.WithCancel(context.Background())
+	ctx := context.Background()
+	b.interruptCtx, b.interruptCtxCancel = context.WithCancel(ctx)
 	atomic.StoreInt32(&b.state, stateCreated)
 
 	option.Apply(b, opts...)
@@ -304,25 +269,8 @@ func (b *OnDemandBlockTaskPool) trySubmit(ctx context.Context, task Task, state 
 func (b *OnDemandBlockTaskPool) allowToCreateGoroutine() bool {
 	b.mutex.RLock()
 	defer b.mutex.RUnlock()
-
-	if b.totalGo == b.maxGo {
-		return false
-	}
-
-	// 这个判断可能太苛刻了，经常导致开协程失败，先注释掉
-	// allGoShouldBeBusy := atomic.LoadInt32(&b.numGoRunningTasks) == b.totalGo
-	// if !allGoShouldBeBusy {
-	// 	return false
-	// }
-
 	rate := float64(len(b.queue)) / float64(cap(b.queue))
-	if rate == 0 || rate < b.queueBacklogRate {
-		// log.Println("rate == 0", rate == 0, "rate", rate, " < ", b.queueBacklogRate)
-		return false
-	}
-
-	// b.totalGo < b.maxGo && rate != 0 && rate >= b.queueBacklogRate
-	return true
+	return (b.totalGo < b.maxGo) && (rate != 0 && rate >= b.queueBacklogRate)
 }
 
 // Start 开始调度任务执行
@@ -345,17 +293,7 @@ func (b *OnDemandBlockTaskPool) Start() error {
 
 		if atomic.CompareAndSwapInt32(&b.state, stateCreated, stateLocked) {
 
-			n := b.initGo
-
-			allowGo := b.maxGo - b.initGo
-			needGo := int32(len(b.queue)) - b.initGo
-			if needGo > 0 {
-				if needGo <= allowGo {
-					n += needGo
-				} else {
-					n += allowGo
-				}
-			}
+			n := b.numOfGoThatCanBeCreate()
 
 			b.increaseTotalGo(n)
 			for i := int32(0); i < n; i++ {
@@ -365,6 +303,20 @@ func (b *OnDemandBlockTaskPool) Start() error {
 			return nil
 		}
 	}
+}
+
+func (b *OnDemandBlockTaskPool) numOfGoThatCanBeCreate() int32 {
+	n := b.initGo
+	allowGo := b.maxGo - b.initGo
+	needGo := int32(len(b.queue)) - b.initGo
+	if needGo > 0 {
+		if needGo <= allowGo {
+			n += needGo
+		} else {
+			n += allowGo
+		}
+	}
+	return n
 }
 
 func (b *OnDemandBlockTaskPool) goroutine(id int) {
@@ -378,7 +330,7 @@ func (b *OnDemandBlockTaskPool) goroutine(id int) {
 	for {
 		// log.Println("id", id, "working for loop")
 		select {
-		case <-b.shutdownNowCtx.Done():
+		case <-b.interruptCtx.Done():
 			// log.Printf("id %d shutdownNow, timeoutGroup.Size=%d left\n", id, b.timeoutGroup.size())
 			b.decreaseTotalGo(1)
 			return
@@ -390,7 +342,6 @@ func (b *OnDemandBlockTaskPool) goroutine(id int) {
 			b.mutex.Unlock()
 			return
 		case task, ok := <-b.queue:
-
 			// log.Println("id", id, "running tasks")
 			if b.timeoutGroup.isIn(id) {
 				// timer只保证至少在等待X时间后才发送信号而不是在X时间内发送信号
@@ -402,54 +353,42 @@ func (b *OnDemandBlockTaskPool) goroutine(id int) {
 				}
 				// log.Println("id", id, "out timeoutGroup")
 			}
-
-			atomic.AddInt32(&b.numGoRunningTasks, 1)
 			if !ok {
-				// b.numGoRunningTasks > 1表示虽然当前协程监听到了b.queue关闭但还有其他协程运行task，当前协程自己退出就好
-				// b.numGoRunningTasks == 1表示只有当前协程"运行task"中，其他协程在一定在"拿到b.queue到已关闭"，这一信号的路上
-				// 绝不会处于运行task中
-				if atomic.CompareAndSwapInt32(&b.numGoRunningTasks, 1, 0) && atomic.LoadInt32(&b.state) == stateClosing {
-					// 在b.queue关闭后，第一个检测到全部task已经自然结束的协程
-					b.shutdownOnce.Do(func() {
-						// 状态迁移
-						atomic.CompareAndSwapInt32(&b.state, stateClosing, stateStopped)
-						// 显示通知外部调用者
-						b.shutdownDone <- struct{}{}
-						close(b.shutdownDone)
-					})
-
-					b.decreaseTotalGo(1)
-					return
-				}
-
-				// 有其他协程运行task中，自己退出就好。
-				atomic.AddInt32(&b.numGoRunningTasks, -1)
 				b.decreaseTotalGo(1)
+				if b.numOfGo() == 0 {
+					// 因调用Shutdown方法导致的协程退出，最后一个退出的协程负责状态迁移及显示通知外部调用者
+					if atomic.CompareAndSwapInt32(&b.state, stateClosing, stateStopped) {
+						b.interruptCtxCancel()
+					}
+				}
 				return
 			}
 
 			// todo handle error
-			_ = task.Run(b.shutdownNowCtx)
+			atomic.AddInt32(&b.numGoRunningTasks, 1)
+			_ = task.Run(b.interruptCtx)
 			atomic.AddInt32(&b.numGoRunningTasks, -1)
 
 			b.mutex.Lock()
 			// log.Println("id", id, "totalGo-mem", b.totalGo-b.timeoutGroup.size(), "totalGo", b.totalGo, "mem", b.timeoutGroup.size())
-			if b.coreGo < b.totalGo && (len(b.queue) == 0 || int32(len(b.queue)) < b.totalGo) {
-				// 协程在(coreGo,maxGo]区间
-				// 如果没有任务可以执行，或者被判定为可能抢不到任务的协程直接退出
-				// 注意：一定要在此处减1才能让此刻等待在mutex上的其他协程被正确地分区
+			noTasksToExecute := len(b.queue) == 0 || int32(len(b.queue)) < b.totalGo
+			if b.coreGo < b.totalGo && b.totalGo <= b.maxGo && noTasksToExecute {
+				// 当前协程属于(coreGo,maxGo]区间，发现没有任务可以执行故直接退出
+				// 注意：一定要在此处减1才能让此刻等待在mutex上的其他协程被正确地划分区间
 				b.totalGo--
 				// log.Println("id", id, "exits....")
 				b.mutex.Unlock()
 				return
 			}
 
-			if b.initGo < b.totalGo-b.timeoutGroup.size() /* && len(b.queue) == 0 */ {
+			if b.initGo < b.totalGo-b.timeoutGroup.size() {
 				// log.Println("id", id, "initGo", b.initGo, "totalGo-mem", b.totalGo-b.timeoutGroup.size(), "totalGo", b.totalGo)
-				// 协程在(initGo，coreGo]区间，如果没有任务可以执行，重置计时器
-				// 当len(b.queue) != 0时，即便协程属于(coreGo,maxGo]区间，也应该给它一个定时器兜底。
-				// 因为现在看队列中有任务，等真去拿的时候可能恰好没任务，如果不给它一个定时器兜底此时就会出现当前协程总数长时间大于始协程数（initGo）的情况。
-				// 直到队列再次有任务时才可能将当前总协程数准确无误地降至初始协程数，因此注释掉len(b.queue) == 0判断条件
+				// 根据需求：
+				// 1. 如果当前协程属于(initGo，coreGo]区间，需要为其分配一个超时器。
+				//    - 当前协程在超时退出前（最大空闲时间内）尝试拿任务，拿到则继续执行，没拿到则超时退出。
+				// 2. 如果当前协程属于(coreGo, maxGo]区间，且有任务可执行，也需要为其分配一个超时器兜底。
+				//    - 因为此时看队列中有任务，等真去拿的时候可能恰好没任务
+				//    - 这会导致当前协程总数（totalGo）长时间大于始协程数（initGo)直到队列再次有任务时才可能将当前总协程数准确地降至初始协程数
 				idleTimer = time.NewTimer(b.maxIdleTime)
 				b.timeoutGroup.add(id)
 				// log.Println("id", id, "add timeoutGroup", "size", b.timeoutGroup.size())
@@ -499,7 +438,7 @@ func (b *OnDemandBlockTaskPool) Shutdown() (<-chan struct{}, error) {
 			// 先关闭等待队列不再允许提交
 			// 同时工作协程能够通过判断b.queue是否被关闭来终止获取任务循环
 			close(b.queue)
-			return b.shutdownDone, nil
+			return b.interruptCtx.Done(), nil
 		}
 
 	}
@@ -529,7 +468,7 @@ func (b *OnDemandBlockTaskPool) ShutdownNow() ([]Task, error) {
 			close(b.queue)
 
 			// 发送中断信号，中断工作协程获取任务循环
-			b.shutdownNowCancel()
+			b.interruptCtxCancel()
 
 			// 清空队列并保存
 			tasks := make([]Task, 0, len(b.queue))
@@ -558,4 +497,54 @@ func (b *OnDemandBlockTaskPool) numOfGo() int32 {
 	n = b.totalGo
 	b.mutex.RUnlock()
 	return n
+}
+
+func (b *OnDemandBlockTaskPool) States(ctx context.Context, interval time.Duration) (<-chan State, error) {
+	if ctx.Err() != nil {
+		return nil, ctx.Err()
+	}
+	if b.interruptCtx.Err() != nil {
+		return nil, b.interruptCtx.Err()
+	}
+
+	statsChan := make(chan State)
+	go func() {
+		ticker := time.NewTicker(interval)
+		defer ticker.Stop()
+		for {
+			select {
+			case timeStamp := <-ticker.C:
+				b.sendState(statsChan, timeStamp.UnixNano())
+			case <-ctx.Done():
+				b.sendState(statsChan, time.Now().UnixNano())
+				close(statsChan)
+				return
+			case <-b.interruptCtx.Done():
+				b.sendState(statsChan, time.Now().UnixNano())
+				close(statsChan)
+				return
+			}
+		}
+	}()
+	return statsChan, nil
+}
+
+func (b *OnDemandBlockTaskPool) sendState(ch chan<- State, timeStamp int64) {
+	// 这里发送 State 不成功则直接丢弃，不考虑重试逻辑，用户对自己的行为负责
+	select {
+	case ch <- b.getState(timeStamp):
+	default:
+	}
+}
+
+func (b *OnDemandBlockTaskPool) getState(timeStamp int64) State {
+	s := State{
+		PoolState:       atomic.LoadInt32(&b.state),
+		GoCnt:           b.numOfGo(),
+		QueueSize:       cap(b.queue),
+		WaitingTasksCnt: len(b.queue),
+		RunningTasksCnt: atomic.LoadInt32(&b.numGoRunningTasks),
+		Timestamp:       timeStamp,
+	}
+	return s
 }

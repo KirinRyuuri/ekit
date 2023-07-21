@@ -1,4 +1,4 @@
-// Copyright 2021 gotomicro
+// Copyright 2021 ecodeclub
 //
 // Licensed under the Apache License, Version 2.0 (the "License");
 // you may not use this file except in compliance with the License.
@@ -35,7 +35,7 @@ func TestSetx_Add(t *testing.T) {
 	})
 }
 
-func TestSetx_Remove(t *testing.T) {
+func TestSetx_Delete(t *testing.T) {
 	testcases := []struct {
 		name    string
 		delVal  int
